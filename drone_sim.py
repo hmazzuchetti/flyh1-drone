@@ -70,45 +70,54 @@ class OpticFlowSimulator:
         sin_yaw = np.sin(drone_yaw)
         forward = np.array([cos_yaw, sin_yaw])
 
-        max_range = 5.0  # v4: aumentado de 4m pra 5m — mais tempo de reação
+        max_range = 5.0
+
+        # v10: acumuladores crus — compressão aplicada no final
+        raw_left = 0.0
+        raw_right = 0.0
+        raw_front = 0.0
 
         for obs in self.obstacles:
-            # Vetor 2D do drone pro obstáculo
             rel = obs['pos'][:2] - drone_pos[:2]
             dist = max(np.linalg.norm(rel), 0.1)
 
-            # Ignorar obstáculos distantes
             if dist > max_range:
                 continue
 
-            # Falloff suave: 1.0 a dist=0, 0.0 a dist=max_range
+            # Falloff quadrático suave
             range_factor = max(0.0, 1.0 - (dist / max_range) ** 2)
 
-            # ---- LATERAL: velocidade angular correta ----
-            # ω = (vx * dy - vy * dx) / dist²
+            # ---- LATERAL ----
             cross = drone_vel[0] * rel[1] - drone_vel[1] * rel[0]
             angular_vel_rads = cross / (dist * dist)
 
-            # Escala pro range do H1 — calibrado pra não saturar longe
-            # Tamanho aparente: obs['radius'] / dist (radianos)
             apparent_size = obs['radius'] / dist
-            angular_vel_deg = np.degrees(abs(angular_vel_rads)) * (1.0 + apparent_size * 3.0) * range_factor * 3.0
+            # v10: removido multiplicador *3.0 — a compressão final cuida do scaling
+            angular_vel_deg = np.degrees(abs(angular_vel_rads)) * (1.0 + apparent_size * 2.0) * range_factor
 
             if cross > 0:
-                flow['left'] += angular_vel_deg
+                raw_left += angular_vel_deg
             else:
-                flow['right'] += angular_vel_deg
+                raw_right += angular_vel_deg
 
             # ---- LOOMING: cone frontal de 60° ----
             rel_unit = rel / dist
-            in_front = np.dot(rel_unit, forward) > 0.5  # cos(60°) = 0.5
+            in_front = np.dot(rel_unit, forward) > 0.5
 
             if in_front:
                 approach_vel = np.dot(drone_vel[:2], rel_unit)
-                if approach_vel > 0:  # se aproximando
-                    # Taxa de expansão: r * v / d²
+                if approach_vel > 0:
                     looming = approach_vel * obs['radius'] / (dist * dist)
-                    flow['front'] += np.degrees(looming) * range_factor * 15.0
+                    raw_front += np.degrees(looming) * range_factor * 10.0
+
+        # v10: compressão sqrt — impede que a soma de N obstáculos distantes
+        # sature o neurônio. Um obstáculo perto (30°/s cru) → sqrt(30)*6 ≈ 33°/s.
+        # Quatro obstáculos longe (5°/s cada = 20 cru) → sqrt(20)*6 ≈ 27°/s.
+        # Sem compressão: 20°/s cru já saturava o H1 a 500 Hz.
+        flow_scale = 6.0
+        flow['left'] = np.sqrt(raw_left) * flow_scale
+        flow['right'] = np.sqrt(raw_right) * flow_scale
+        flow['front'] = np.sqrt(raw_front) * flow_scale
 
         return flow
 
@@ -342,7 +351,7 @@ def run_simulation(gui=True, duration=30.0):
 
         # Checar se chegou na meta
         dist_to_goal = np.sqrt((pos[0] - goal_pos[0])**2 + (pos[1] - goal_pos[1])**2)
-        if dist_to_goal < 0.5:
+        if dist_to_goal < 0.8:
             print(f"\n✓ META ALCANÇADA em t={sim_time:.1f}s!")
             print(f"  Colisões: {log['collisions']}")
             break
@@ -376,7 +385,10 @@ def run_simulation(gui=True, duration=30.0):
         # Normalizar pra [-pi, pi] pra evitar acúmulo
         drone_yaw = (drone_yaw + np.pi) % (2 * np.pi) - np.pi
 
-        forward_speed = max(0.3, base_speed + cmd['pitch_adjust'])
+        # v10: desaceleração perto da meta — impede overshoot e U-turn
+        # Começa a frear a 3m, velocidade mínima 0.15 m/s a 0m
+        goal_speed_factor = np.clip(dist_to_goal / 3.0, 0.05, 1.0)
+        forward_speed = max(0.15, (base_speed + cmd['pitch_adjust']) * goal_speed_factor)
         target_vz = cmd['throttle_adjust']
 
         # Velocidade no frame world — baseada no yaw cinemático
