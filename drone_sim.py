@@ -55,10 +55,11 @@ class OpticFlowSimulator:
             dict com flow_left, flow_right, flow_front (°/s)
             Esses são os 3 canais que alimentam a H1.
 
-        NOTA: Usa fórmula correta de velocidade angular (produto vetorial).
-        ω = (vx * dy - vy * dx) / dist²  — independe do yaw, detecta lateral
-        mesmo quando drone voa reto. Versão anterior dava ω=0 nessa situação,
-        deixando H1 left/right saturados por ruído sem sinal real.
+        v3 — corrige saturação dos 3 neurônios:
+        - Cutoff de distância: obstáculos >4m são ignorados (background)
+        - Falloff suave: contribuição cai com 1/dist³ (não 1/dist²)
+        - Multiplicadores calibrados pra que neurônios fiquem em 0-200 Hz
+          normalmente, e só se aproximem de 500 Hz com obstáculo a <1m
         """
         flow = {'left': 0.0, 'right': 0.0, 'front': 0.0}
 
@@ -69,21 +70,29 @@ class OpticFlowSimulator:
         sin_yaw = np.sin(drone_yaw)
         forward = np.array([cos_yaw, sin_yaw])
 
+        max_range = 4.0  # obstáculos além disso = background, ignorados
+
         for obs in self.obstacles:
             # Vetor 2D do drone pro obstáculo
             rel = obs['pos'][:2] - drone_pos[:2]
             dist = max(np.linalg.norm(rel), 0.1)
 
+            # Ignorar obstáculos distantes
+            if dist > max_range:
+                continue
+
+            # Falloff suave: 1.0 a dist=0, 0.0 a dist=max_range
+            range_factor = max(0.0, 1.0 - (dist / max_range) ** 2)
+
             # ---- LATERAL: velocidade angular correta ----
             # ω = (vx * dy - vy * dx) / dist²
-            # Positivo → obstáculo à esquerda do caminho do drone
             cross = drone_vel[0] * rel[1] - drone_vel[1] * rel[0]
             angular_vel_rads = cross / (dist * dist)
 
-            # Escala pro range do H1 (50–500°/s)
-            # Fator de tamanho aparente: mais forte quando obstáculo próximo
-            apparent_size_factor = 1.0 + (obs['radius'] / dist) * 8.0
-            angular_vel_deg = np.degrees(abs(angular_vel_rads)) * apparent_size_factor * 10.0
+            # Escala pro range do H1 — calibrado pra não saturar longe
+            # Tamanho aparente: obs['radius'] / dist (radianos)
+            apparent_size = obs['radius'] / dist
+            angular_vel_deg = np.degrees(abs(angular_vel_rads)) * (1.0 + apparent_size * 3.0) * range_factor * 3.0
 
             if cross > 0:
                 flow['left'] += angular_vel_deg
@@ -95,12 +104,11 @@ class OpticFlowSimulator:
             in_front = np.dot(rel_unit, forward) > 0.5  # cos(60°) = 0.5
 
             if in_front:
-                # Velocidade de aproximação (projeção na direção do obstáculo)
                 approach_vel = np.dot(drone_vel[:2], rel_unit)
                 if approach_vel > 0:  # se aproximando
-                    # Taxa de expansão da imagem retiniana = r * v / d²
+                    # Taxa de expansão: r * v / d²
                     looming = approach_vel * obs['radius'] / (dist * dist)
-                    flow['front'] += np.degrees(looming) * 60.0
+                    flow['front'] += np.degrees(looming) * range_factor * 15.0
 
         return flow
 
@@ -123,10 +131,10 @@ class H1Controller:
         self.h1_right = H1Neuron()
         self.h1_front = H1Neuron()
 
-        # Ganhos do controlador v2 — ajustados pra nova fórmula de optic flow
-        self.yaw_gain = 0.008       # era 0.002 — sinal agora proporcional a distância
-        self.brake_gain = 0.004     # era 0.001
-        self.altitude_gain = 0.002  # era 0.0005
+        # Ganhos do controlador v3 — entre v1 (frouxo demais) e v2 (agressivo demais)
+        self.yaw_gain = 0.005       # v1=0.002, v2=0.008
+        self.brake_gain = 0.002     # v1=0.001, v2=0.004
+        self.altitude_gain = 0.001  # v1=0.0005, v2=0.002
 
     def step(self, flow: dict, dt: float = 1e-4) -> dict:
         """
@@ -249,7 +257,7 @@ def run_simulation(gui=True, duration=30.0):
     h1_steps_per_sim = int(sim_dt / h1_dt)
 
     # Velocidade base do drone (avança pra frente constantemente)
-    base_speed = 0.55  # m/s — era 0.8, reduzido pra dar mais tempo de reação
+    base_speed = 0.7  # m/s — v3: entre v1 (0.8) e v2 (0.55)
 
     # Câmera tracking
     if gui:
