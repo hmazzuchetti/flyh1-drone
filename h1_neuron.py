@@ -31,8 +31,10 @@ class H1Neuron:
     V_RESET = -65e-3     # potencial pós-spike (-65mV)
     R_M = 40e6           # resistência de membrana (40 MΩ)
     T_REF = 2e-3         # período refratário (2ms)
-    GAIN = 2.5e-9        # nA por grau/s (calibrado pra ~200 Hz no vôo normal)
-    NOISE_STD = 0.15e-9  # ruído sináptico
+    GAIN = 0.25e-9       # nA por grau/s — reduzido 10x pra expandir range dinâmico
+                         # Antes: 2.5e-9 saturava em ~340 Hz com 1°/s de flow
+                         # Agora: range útil ~0-400 Hz ao longo de 0-100°/s
+    NOISE_STD = 0.05e-9  # ruído sináptico — reduzido junto pro baseline ficar limpo
 
     def __init__(self):
         self.V = self.V_REST

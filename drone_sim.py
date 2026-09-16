@@ -131,29 +131,27 @@ class H1Controller:
         self.h1_right = H1Neuron()
         self.h1_front = H1Neuron()
 
-        # Ganhos v8 — corrige o problema de speed:
-        # O H1 LIF dispara ~340+ Hz pra QUALQUER flow positivo (range útil é ~340-500 Hz).
-        # Braking e escape agora usam rate ACIMA do baseline, não rate absoluto.
-        self.yaw_gain = 0.003
-        self.brake_gain = 0.004          # aplicado só sobre excesso acima do baseline
+        # Ganhos v9 — recalibrado pro novo range dinâmico do H1:
+        # Com GAIN=0.25e-9 o H1 agora tem range ~0-400 Hz (antes: 340-500 Hz).
+        # Sem flow → 0 Hz. Flow moderado (~20°/s) → ~150 Hz. Perto (~50°/s) → ~300 Hz.
+        # Isso elimina o baseline de 340 Hz e permite controle proporcional direto.
+        self.yaw_gain = 0.005           # maior porque o diferencial agora pode ser 0-300 Hz
+        self.brake_gain = 0.002         # aplicado sobre rate absoluto (não mais excesso)
         self.altitude_gain = 0.001
 
-        # Baseline: taxa de disparo do H1 quando há motion mas sem perigo real.
-        # O LIF satura em ~340 Hz pra 1-5 °/s de flow. Só acima de ~400 Hz
-        # indica proximidade real.
-        self.front_baseline = 350.0      # Hz — abaixo disso é ruído de fundo
+        # Sem baseline — rate ~0 Hz em espaço aberto, sobe proporcionalmente
+        self.front_baseline = 0.0       # Hz — o neurônio já fica quieto sem estímulo
 
-        # Reflexo de escape: quando looming EXCEDE baseline por margem significativa
-        self.escape_threshold = 80.0     # Hz ACIMA do baseline (= ~430 Hz absoluto)
-        self.escape_gain = 0.5
+        # Reflexo de escape: quando frontal indica obstáculo iminente
+        self.escape_threshold = 200.0   # Hz absoluto — ~30°/s de looming
+        self.escape_gain = 0.8
 
     def step(self, flow: dict, dt: float = 1e-4) -> dict:
         """
         Recebe optic flow, retorna comandos de controle.
 
-        v8: braking e escape usam rate EXCEDENTE acima do baseline neuronal
-        (~350 Hz). O H1 LIF dispara 340+ Hz pra qualquer motion — só rate
-        acima do baseline indica proximidade real.
+        v9: com GAIN reduzido 10x, o H1 agora tem range 0-400 Hz proporcional.
+        Sem baseline artificial — rate ~0 em espaço aberto, sobe com proximidade.
 
         Returns:
             dict com yaw_rate, throttle_adjust, pitch_adjust, rates
@@ -287,7 +285,7 @@ def run_simulation(gui=True, duration=30.0):
     h1_steps_per_sim = int(sim_dt / h1_dt)
 
     # Velocidade base do drone (avança pra frente constantemente)
-    base_speed = 0.9  # m/s — v8: mais rápido, braking agora é baseline-subtracted
+    base_speed = 0.9  # m/s — v9: mantém velocidade, braking proporcional ao rate absoluto
 
     # Câmera tracking
     if gui:
@@ -315,14 +313,23 @@ def run_simulation(gui=True, duration=30.0):
     # Isso elimina o desacoplamento entre angular velocity e linear velocity
     # que causava o drone girar 180° e sair andando pra trás.
     drone_yaw = 0.0  # rad — começa apontando pra +X (direção da meta)
+    forward_speed = base_speed  # inicializa pra o primeiro frame usar vel analítica
 
     while sim_time < duration:
-        # Estado do drone — posição do PyBullet, yaw do Python
+        # Estado do drone — posição do PyBullet, yaw e velocidade do Python
         pos, orn = p.getBasePositionAndOrientation(drone_id)
-        vel, _ = p.getBaseVelocity(drone_id)
         pos = np.array(pos)
-        vel = np.array(vel)
         yaw = drone_yaw  # usar nosso yaw, não o do quaternion
+
+        # v9: velocidade ANALÍTICA, não do PyBullet.
+        # getBaseVelocity() retorna vel do frame anterior, já degradada pelo
+        # linearDamping=0.9. Resultado: cross ≈ 0, flow lateral ≈ 0, zero desvio.
+        # A velocidade real é a que nós mandamos — forward_speed * [cos,sin,0].
+        vel = np.array([
+            forward_speed * np.cos(drone_yaw),
+            forward_speed * np.sin(drone_yaw),
+            0.0
+        ])
 
         # Checar colisão
         contacts = p.getContactPoints(bodyA=drone_id)
