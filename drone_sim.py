@@ -70,7 +70,7 @@ class OpticFlowSimulator:
         sin_yaw = np.sin(drone_yaw)
         forward = np.array([cos_yaw, sin_yaw])
 
-        max_range = 4.0  # obstáculos além disso = background, ignorados
+        max_range = 5.0  # v4: aumentado de 4m pra 5m — mais tempo de reação
 
         for obs in self.obstacles:
             # Vetor 2D do drone pro obstáculo
@@ -131,21 +131,30 @@ class H1Controller:
         self.h1_right = H1Neuron()
         self.h1_front = H1Neuron()
 
-        # Ganhos do controlador v3 — entre v1 (frouxo demais) e v2 (agressivo demais)
-        self.yaw_gain = 0.005       # v1=0.002, v2=0.008
-        self.brake_gain = 0.002     # v1=0.001, v2=0.004
-        self.altitude_gain = 0.001  # v1=0.0005, v2=0.002
+        # Ganhos v4 — com reflexo de escape lateral
+        self.yaw_gain = 0.006
+        self.brake_gain = 0.003
+        self.altitude_gain = 0.001
+
+        # Reflexo de escape: quando looming é alto E laterais são parecidos,
+        # a mosca escolhe um lado e vira forte. Sem isso, obstáculo frontal
+        # causa diferencial ~0 e o drone vai reto pro pilar.
+        self.escape_threshold = 150.0   # Hz: looming acima disso ativa escape
+        self.escape_gain = 0.012        # ganho forte do escape
+        self.escape_symmetry = 0.7      # se |L-R|/(L+R) < 0.7, laterais são "parecidos"
+        self.escape_side = 1.0          # +1 = escapa pra direita por default
 
     def step(self, flow: dict, dt: float = 1e-4) -> dict:
         """
         Recebe optic flow, retorna comandos de controle.
 
+        v4: adiciona reflexo de escape (dodge response).
+        Quando looming é alto e os sinais laterais são simétricos (obstáculo
+        quase em frente), o drone escolhe o lado com menos flow e vira forte.
+        Baseado no escape response da mosca (Card & Dickinson, 2008).
+
         Returns:
-            dict com:
-                - yaw_rate: taxa de giro (positivo = vira pra direita)
-                - throttle_adjust: ajuste de throttle (-1 a 1)
-                - pitch_adjust: ajuste de pitch (negativo = freia)
-                - rates: dict com spike rates dos 3 neurônios
+            dict com yaw_rate, throttle_adjust, pitch_adjust, rates
         """
         r_left = self.h1_left.step(flow['left'], dt)
         r_right = self.h1_right.step(flow['right'], dt)
@@ -155,17 +164,37 @@ class H1Controller:
         rate_right = r_right['spike_rate']
         rate_front = r_front['spike_rate']
 
-        # Controle diferencial: mais flow na esquerda → vira pra direita
+        # --- Controle diferencial normal ---
         yaw_rate = (rate_left - rate_right) * self.yaw_gain
 
-        # Looming frontal → freia e sobe
+        # --- Reflexo de escape lateral ---
+        # Ativado quando: (1) looming alto E (2) sinais laterais parecidos
+        total_lateral = rate_left + rate_right
+        if total_lateral > 1.0:  # evitar divisão por zero
+            asymmetry = abs(rate_left - rate_right) / total_lateral
+        else:
+            asymmetry = 1.0  # sem sinal = sem escape
+
+        if rate_front > self.escape_threshold and asymmetry < self.escape_symmetry:
+            # Escolhe o lado com MENOS flow (mais espaço livre)
+            if rate_left <= rate_right:
+                escape_dir = 1.0   # vira pra direita (esquerda tem menos obstáculo)
+            else:
+                escape_dir = -1.0  # vira pra esquerda
+
+            # Intensidade proporcional ao looming
+            escape_intensity = (rate_front - self.escape_threshold) / 500.0
+            escape_intensity = np.clip(escape_intensity, 0.0, 1.0)
+            yaw_rate += escape_dir * escape_intensity * self.escape_gain * 50.0
+
+        # --- Looming frontal → freia ---
         pitch_adjust = -rate_front * self.brake_gain
         throttle_adjust = rate_front * self.altitude_gain
 
         return {
-            'yaw_rate': np.clip(yaw_rate, -1.0, 1.0),   # era ±0.5 — permite curvas mais fechadas
-            'pitch_adjust': np.clip(pitch_adjust, -0.5, 0.0),  # era -0.3
-            'throttle_adjust': np.clip(throttle_adjust, 0.0, 0.5),  # era 0.3
+            'yaw_rate': np.clip(yaw_rate, -1.5, 1.5),
+            'pitch_adjust': np.clip(pitch_adjust, -0.6, 0.0),
+            'throttle_adjust': np.clip(throttle_adjust, 0.0, 0.5),
             'rates': {
                 'left': rate_left,
                 'right': rate_right,
