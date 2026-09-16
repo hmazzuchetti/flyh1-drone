@@ -281,7 +281,7 @@ def run_simulation(gui=True, duration=30.0):
     h1_steps_per_sim = int(sim_dt / h1_dt)
 
     # Velocidade base do drone (avança pra frente constantemente)
-    base_speed = 0.7  # m/s — v3: entre v1 (0.8) e v2 (0.55)
+    base_speed = 0.7  # m/s
 
     # Câmera tracking
     if gui:
@@ -304,15 +304,19 @@ def run_simulation(gui=True, duration=30.0):
     sim_time = 0.0
     step_count = 0
 
-    while sim_time < duration:
-        # Estado do drone
-        pos, orn = p.getBasePositionAndOrientation(drone_id)
-        vel, ang_vel = p.getBaseVelocity(drone_id)
-        euler = p.getEulerFromQuaternion(orn)
-        yaw = euler[2]
+    # v7: controle PURAMENTE CINEMÁTICO
+    # O yaw é uma variável Python, não do PyBullet.
+    # Isso elimina o desacoplamento entre angular velocity e linear velocity
+    # que causava o drone girar 180° e sair andando pra trás.
+    drone_yaw = 0.0  # rad — começa apontando pra +X (direção da meta)
 
+    while sim_time < duration:
+        # Estado do drone — posição do PyBullet, yaw do Python
+        pos, orn = p.getBasePositionAndOrientation(drone_id)
+        vel, _ = p.getBaseVelocity(drone_id)
         pos = np.array(pos)
         vel = np.array(vel)
+        yaw = drone_yaw  # usar nosso yaw, não o do quaternion
 
         # Checar colisão
         contacts = p.getContactPoints(bodyA=drone_id)
@@ -324,7 +328,8 @@ def run_simulation(gui=True, duration=30.0):
                         print(f"  [!] Colisão em t={sim_time:.1f}s pos=({pos[0]:.1f}, {pos[1]:.1f})")
 
         # Checar se chegou na meta
-        if pos[0] >= goal_pos[0]:
+        dist_to_goal = np.sqrt((pos[0] - goal_pos[0])**2 + (pos[1] - goal_pos[1])**2)
+        if dist_to_goal < 0.5:
             print(f"\n✓ META ALCANÇADA em t={sim_time:.1f}s!")
             print(f"  Colisões: {log['collisions']}")
             break
@@ -337,34 +342,39 @@ def run_simulation(gui=True, duration=30.0):
         for _ in range(h1_steps_per_sim):
             cmd = controller.step(flow, h1_dt)
 
-        # Aplicar controle — v6: goal-directed yaw (nunca "vira de costas")
-        # O drone sempre tende a apontar pra meta; H1 adiciona desvio lateral.
-        # Sem isso o yaw acumula, cos(yaw) fica negativo e o drone vai pra trás.
+        # --- v7: Goal-directed yaw + H1 desvio, puramente cinemático ---
         goal_2d = np.array([goal_pos[0], goal_pos[1]])
         pos_2d = np.array([pos[0], pos[1]])
         to_goal = goal_2d - pos_2d
         goal_yaw = np.arctan2(to_goal[1], to_goal[0])
 
-        # Erro de yaw em relação à meta, normalizado pra [-pi, pi]
+        # Erro de yaw normalizado pra [-pi, pi]
         yaw_error = goal_yaw - yaw
         yaw_error = (yaw_error + np.pi) % (2 * np.pi) - np.pi
 
-        # Mix: pull de retorno à meta + H1 desvio lateral
-        # k_return alto o suficiente pra superar o escape_gain quando longe da meta
-        k_return = 4.0
+        # k_return puxa pro goal; H1 desvia de obstáculos
+        # k_return=2.0 é suficiente pra manter rumo sem dominar H1
+        k_return = 2.0
         yaw_rate_total = cmd['yaw_rate'] + k_return * yaw_error
-        yaw_rate_total = np.clip(yaw_rate_total, -3.0, 3.0)
+        yaw_rate_total = np.clip(yaw_rate_total, -2.0, 2.0)
 
-        target_yaw = yaw + yaw_rate_total * sim_dt
+        # Atualizar yaw (cinemático puro — sem motor de física)
+        drone_yaw += yaw_rate_total * sim_dt
+        # Normalizar pra [-pi, pi] pra evitar acúmulo
+        drone_yaw = (drone_yaw + np.pi) % (2 * np.pi) - np.pi
+
         forward_speed = max(0.1, base_speed + cmd['pitch_adjust'])
         target_vz = cmd['throttle_adjust']
 
-        # Velocidade no frame world
-        vx = forward_speed * np.cos(target_yaw)
-        vy = forward_speed * np.sin(target_yaw)
+        # Velocidade no frame world — baseada no yaw cinemático
+        vx = forward_speed * np.cos(drone_yaw)
+        vy = forward_speed * np.sin(drone_yaw)
         vz = (1.5 - pos[2]) * 2.0 + target_vz  # PD pra altitude + ajuste H1
 
-        p.resetBaseVelocity(drone_id, [vx, vy, vz], [0, 0, yaw_rate_total * 3])
+        # Aplicar posição/orientação diretamente (sem angular velocity)
+        new_orn = p.getQuaternionFromEuler([0, 0, drone_yaw])
+        p.resetBasePositionAndOrientation(drone_id, pos.tolist(), new_orn)
+        p.resetBaseVelocity(drone_id, [vx, vy, vz], [0, 0, 0])
 
         # Log
         if step_count % 24 == 0:  # a cada ~0.1s
@@ -375,11 +385,11 @@ def run_simulation(gui=True, duration=30.0):
             log['rate_left'].append(cmd['rates']['left'])
             log['rate_right'].append(cmd['rates']['right'])
             log['rate_front'].append(cmd['rates']['front'])
-            log['yaw'].append(np.degrees(yaw))
+            log['yaw'].append(np.degrees(drone_yaw))
 
         # Print periódico
         if step_count % 480 == 0 and step_count > 0:
-            print(f"  t={sim_time:.1f}s  x={pos[0]:.1f}  y={pos[1]:.1f}  "
+            print(f"  t={sim_time:.1f}s  x={pos[0]:.1f}  y={pos[1]:.1f}  yaw={np.degrees(drone_yaw):.0f}°  "
                   f"H1: L={cmd['rates']['left']:.0f} R={cmd['rates']['right']:.0f} "
                   f"F={cmd['rates']['front']:.0f} Hz")
 
