@@ -140,7 +140,7 @@ class H1Controller:
         # Reflexo de escape: quando looming é alto, drone SEMPRE escapa
         # (independente de simetria — simetria só define a DIREÇÃO)
         self.escape_threshold = 100.0   # Hz: looming acima disso ativa escape
-        self.escape_gain = 0.8          # ganho forte do escape (rad/s)
+        self.escape_gain = 0.4          # v6: reduzido — k_return compensa
 
     def step(self, flow: dict, dt: float = 1e-4) -> dict:
         """
@@ -337,9 +337,25 @@ def run_simulation(gui=True, duration=30.0):
         for _ in range(h1_steps_per_sim):
             cmd = controller.step(flow, h1_dt)
 
-        # Aplicar controle
-        # CORREÇÃO: multiplicar yaw_rate por sim_dt — sem isso vira ~86°/step
-        target_yaw = yaw + cmd['yaw_rate'] * sim_dt
+        # Aplicar controle — v6: goal-directed yaw (nunca "vira de costas")
+        # O drone sempre tende a apontar pra meta; H1 adiciona desvio lateral.
+        # Sem isso o yaw acumula, cos(yaw) fica negativo e o drone vai pra trás.
+        goal_2d = np.array([goal_pos[0], goal_pos[1]])
+        pos_2d = np.array([pos[0], pos[1]])
+        to_goal = goal_2d - pos_2d
+        goal_yaw = np.arctan2(to_goal[1], to_goal[0])
+
+        # Erro de yaw em relação à meta, normalizado pra [-pi, pi]
+        yaw_error = goal_yaw - yaw
+        yaw_error = (yaw_error + np.pi) % (2 * np.pi) - np.pi
+
+        # Mix: pull de retorno à meta + H1 desvio lateral
+        # k_return alto o suficiente pra superar o escape_gain quando longe da meta
+        k_return = 4.0
+        yaw_rate_total = cmd['yaw_rate'] + k_return * yaw_error
+        yaw_rate_total = np.clip(yaw_rate_total, -3.0, 3.0)
+
+        target_yaw = yaw + yaw_rate_total * sim_dt
         forward_speed = max(0.1, base_speed + cmd['pitch_adjust'])
         target_vz = cmd['throttle_adjust']
 
@@ -348,7 +364,7 @@ def run_simulation(gui=True, duration=30.0):
         vy = forward_speed * np.sin(target_yaw)
         vz = (1.5 - pos[2]) * 2.0 + target_vz  # PD pra altitude + ajuste H1
 
-        p.resetBaseVelocity(drone_id, [vx, vy, vz], [0, 0, cmd['yaw_rate'] * 5])
+        p.resetBaseVelocity(drone_id, [vx, vy, vz], [0, 0, yaw_rate_total * 3])
 
         # Log
         if step_count % 24 == 0:  # a cada ~0.1s
