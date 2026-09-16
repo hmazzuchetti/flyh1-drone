@@ -54,6 +54,11 @@ class OpticFlowSimulator:
         Returns:
             dict com flow_left, flow_right, flow_front (°/s)
             Esses são os 3 canais que alimentam a H1.
+
+        NOTA: Usa fórmula correta de velocidade angular (produto vetorial).
+        ω = (vx * dy - vy * dx) / dist²  — independe do yaw, detecta lateral
+        mesmo quando drone voa reto. Versão anterior dava ω=0 nessa situação,
+        deixando H1 left/right saturados por ruído sem sinal real.
         """
         flow = {'left': 0.0, 'right': 0.0, 'front': 0.0}
 
@@ -62,38 +67,40 @@ class OpticFlowSimulator:
 
         cos_yaw = np.cos(drone_yaw)
         sin_yaw = np.sin(drone_yaw)
+        forward = np.array([cos_yaw, sin_yaw])
 
         for obs in self.obstacles:
-            # Vetor do drone pro obstáculo
-            rel = obs['pos'] - drone_pos
-            dist = np.linalg.norm(rel[:2])  # distância horizontal
-            if dist < 0.1:
-                dist = 0.1  # evita divisão por zero
+            # Vetor 2D do drone pro obstáculo
+            rel = obs['pos'][:2] - drone_pos[:2]
+            dist = max(np.linalg.norm(rel), 0.1)
 
-            # Projetar no frame do drone (frente/lateral)
-            # frente = eixo x rotacionado, lateral = eixo y rotacionado
-            front_component = rel[0] * cos_yaw + rel[1] * sin_yaw
-            lateral_component = -rel[0] * sin_yaw + rel[1] * cos_yaw
+            # ---- LATERAL: velocidade angular correta ----
+            # ω = (vx * dy - vy * dx) / dist²
+            # Positivo → obstáculo à esquerda do caminho do drone
+            cross = drone_vel[0] * rel[1] - drone_vel[1] * rel[0]
+            angular_vel_rads = cross / (dist * dist)
 
-            # Velocidade relativa projetada
-            rel_vel = -drone_vel  # se drone vai pra frente, obstáculo "vem" pra trás
-            vel_front = rel_vel[0] * cos_yaw + rel_vel[1] * sin_yaw
-            vel_lateral = -rel_vel[0] * sin_yaw + rel_vel[1] * cos_yaw
+            # Escala pro range do H1 (50–500°/s)
+            # Fator de tamanho aparente: mais forte quando obstáculo próximo
+            apparent_size_factor = 1.0 + (obs['radius'] / dist) * 8.0
+            angular_vel_deg = np.degrees(abs(angular_vel_rads)) * apparent_size_factor * 10.0
 
-            # Optic flow = velocidade angular aparente (v_perpendicular / distância)
-            # Convertido pra graus/s
-            angular_vel = np.degrees(abs(vel_lateral) / dist) * (obs['radius'] / dist)
-
-            # Atribuir ao lado correto
-            if lateral_component > 0:
-                flow['left'] += angular_vel
+            if cross > 0:
+                flow['left'] += angular_vel_deg
             else:
-                flow['right'] += angular_vel
+                flow['right'] += angular_vel_deg
 
-            # Looming (expansão frontal) — velocidade de aproximação / distância²
-            if front_component > 0:  # obstáculo à frente
-                looming = np.degrees(abs(vel_front) / (dist * dist)) * obs['radius'] * 10
-                flow['front'] += looming
+            # ---- LOOMING: cone frontal de 60° ----
+            rel_unit = rel / dist
+            in_front = np.dot(rel_unit, forward) > 0.5  # cos(60°) = 0.5
+
+            if in_front:
+                # Velocidade de aproximação (projeção na direção do obstáculo)
+                approach_vel = np.dot(drone_vel[:2], rel_unit)
+                if approach_vel > 0:  # se aproximando
+                    # Taxa de expansão da imagem retiniana = r * v / d²
+                    looming = approach_vel * obs['radius'] / (dist * dist)
+                    flow['front'] += np.degrees(looming) * 60.0
 
         return flow
 
@@ -116,10 +123,10 @@ class H1Controller:
         self.h1_right = H1Neuron()
         self.h1_front = H1Neuron()
 
-        # Ganhos do controlador (tunados empiricamente)
-        self.yaw_gain = 0.002       # quanto o drone vira por Hz de diferença
-        self.brake_gain = 0.001     # quanto freia por Hz de looming
-        self.altitude_gain = 0.0005 # quanto sobe por Hz de looming
+        # Ganhos do controlador v2 — ajustados pra nova fórmula de optic flow
+        self.yaw_gain = 0.008       # era 0.002 — sinal agora proporcional a distância
+        self.brake_gain = 0.004     # era 0.001
+        self.altitude_gain = 0.002  # era 0.0005
 
     def step(self, flow: dict, dt: float = 1e-4) -> dict:
         """
@@ -148,9 +155,9 @@ class H1Controller:
         throttle_adjust = rate_front * self.altitude_gain
 
         return {
-            'yaw_rate': np.clip(yaw_rate, -0.5, 0.5),
-            'pitch_adjust': np.clip(pitch_adjust, -0.3, 0.0),
-            'throttle_adjust': np.clip(throttle_adjust, 0.0, 0.3),
+            'yaw_rate': np.clip(yaw_rate, -1.0, 1.0),   # era ±0.5 — permite curvas mais fechadas
+            'pitch_adjust': np.clip(pitch_adjust, -0.5, 0.0),  # era -0.3
+            'throttle_adjust': np.clip(throttle_adjust, 0.0, 0.5),  # era 0.3
             'rates': {
                 'left': rate_left,
                 'right': rate_right,
@@ -242,7 +249,7 @@ def run_simulation(gui=True, duration=30.0):
     h1_steps_per_sim = int(sim_dt / h1_dt)
 
     # Velocidade base do drone (avança pra frente constantemente)
-    base_speed = 0.8  # m/s
+    base_speed = 0.55  # m/s — era 0.8, reduzido pra dar mais tempo de reação
 
     # Câmera tracking
     if gui:
