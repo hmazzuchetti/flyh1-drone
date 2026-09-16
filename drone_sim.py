@@ -131,25 +131,29 @@ class H1Controller:
         self.h1_right = H1Neuron()
         self.h1_front = H1Neuron()
 
-        # Ganhos v5 — calibrados pra yaw_rate em rad/s (aplicado * sim_dt no loop)
-        # Com rate=100 Hz → yaw_rate = 0.3 rad/s → 0.3/240 ≈ 0.001 rad/step
+        # Ganhos v8 — corrige o problema de speed:
+        # O H1 LIF dispara ~340+ Hz pra QUALQUER flow positivo (range útil é ~340-500 Hz).
+        # Braking e escape agora usam rate ACIMA do baseline, não rate absoluto.
         self.yaw_gain = 0.003
-        self.brake_gain = 0.003
+        self.brake_gain = 0.004          # aplicado só sobre excesso acima do baseline
         self.altitude_gain = 0.001
 
-        # Reflexo de escape: quando looming é alto, drone SEMPRE escapa
-        # (independente de simetria — simetria só define a DIREÇÃO)
-        self.escape_threshold = 100.0   # Hz: looming acima disso ativa escape
-        self.escape_gain = 0.4          # v6: reduzido — k_return compensa
+        # Baseline: taxa de disparo do H1 quando há motion mas sem perigo real.
+        # O LIF satura em ~340 Hz pra 1-5 °/s de flow. Só acima de ~400 Hz
+        # indica proximidade real.
+        self.front_baseline = 350.0      # Hz — abaixo disso é ruído de fundo
+
+        # Reflexo de escape: quando looming EXCEDE baseline por margem significativa
+        self.escape_threshold = 80.0     # Hz ACIMA do baseline (= ~430 Hz absoluto)
+        self.escape_gain = 0.5
 
     def step(self, flow: dict, dt: float = 1e-4) -> dict:
         """
         Recebe optic flow, retorna comandos de controle.
 
-        v4: adiciona reflexo de escape (dodge response).
-        Quando looming é alto e os sinais laterais são simétricos (obstáculo
-        quase em frente), o drone escolhe o lado com menos flow e vira forte.
-        Baseado no escape response da mosca (Card & Dickinson, 2008).
+        v8: braking e escape usam rate EXCEDENTE acima do baseline neuronal
+        (~350 Hz). O H1 LIF dispara 340+ Hz pra qualquer motion — só rate
+        acima do baseline indica proximidade real.
 
         Returns:
             dict com yaw_rate, throttle_adjust, pitch_adjust, rates
@@ -167,9 +171,11 @@ class H1Controller:
         yaw_rate = (rate_right - rate_left) * self.yaw_gain
 
         # --- Reflexo de escape lateral ---
-        # Ativado quando looming alto — SEMPRE.
-        # Simetria só define a direção (o lado com menos flow = mais espaço).
-        if rate_front > self.escape_threshold:
+        # Ativado quando looming EXCEDE baseline por margem significativa.
+        # rate_front ~350 Hz é normal (background). Escape só acima do threshold.
+        front_excess = max(0.0, rate_front - self.front_baseline)
+
+        if front_excess > self.escape_threshold:
             # Escolhe o lado com MENOS flow (mais espaço livre)
             # Se ambos zero (obstáculo direto em frente): escolhe direita por default
             if rate_left <= rate_right:
@@ -178,13 +184,13 @@ class H1Controller:
                 escape_dir = -1.0  # vira pra esquerda
 
             # Intensidade proporcional ao excesso acima do threshold
-            escape_intensity = (rate_front - self.escape_threshold) / 400.0
+            escape_intensity = (front_excess - self.escape_threshold) / 150.0
             escape_intensity = np.clip(escape_intensity, 0.0, 1.0)
             yaw_rate += escape_dir * escape_intensity * self.escape_gain
 
-        # --- Looming frontal → freia ---
-        pitch_adjust = -rate_front * self.brake_gain
-        throttle_adjust = rate_front * self.altitude_gain
+        # --- Looming frontal → freia (só o EXCESSO acima do baseline) ---
+        pitch_adjust = -front_excess * self.brake_gain
+        throttle_adjust = front_excess * self.altitude_gain
 
         return {
             'yaw_rate': np.clip(yaw_rate, -2.0, 2.0),
@@ -281,7 +287,7 @@ def run_simulation(gui=True, duration=30.0):
     h1_steps_per_sim = int(sim_dt / h1_dt)
 
     # Velocidade base do drone (avança pra frente constantemente)
-    base_speed = 0.7  # m/s
+    base_speed = 0.9  # m/s — v8: mais rápido, braking agora é baseline-subtracted
 
     # Câmera tracking
     if gui:
@@ -363,7 +369,7 @@ def run_simulation(gui=True, duration=30.0):
         # Normalizar pra [-pi, pi] pra evitar acúmulo
         drone_yaw = (drone_yaw + np.pi) % (2 * np.pi) - np.pi
 
-        forward_speed = max(0.1, base_speed + cmd['pitch_adjust'])
+        forward_speed = max(0.3, base_speed + cmd['pitch_adjust'])
         target_vz = cmd['throttle_adjust']
 
         # Velocidade no frame world — baseada no yaw cinemático
