@@ -131,18 +131,16 @@ class H1Controller:
         self.h1_right = H1Neuron()
         self.h1_front = H1Neuron()
 
-        # Ganhos v4 — com reflexo de escape lateral
-        self.yaw_gain = 0.006
+        # Ganhos v5 — calibrados pra yaw_rate em rad/s (aplicado * sim_dt no loop)
+        # Com rate=100 Hz → yaw_rate = 0.3 rad/s → 0.3/240 ≈ 0.001 rad/step
+        self.yaw_gain = 0.003
         self.brake_gain = 0.003
         self.altitude_gain = 0.001
 
-        # Reflexo de escape: quando looming é alto E laterais são parecidos,
-        # a mosca escolhe um lado e vira forte. Sem isso, obstáculo frontal
-        # causa diferencial ~0 e o drone vai reto pro pilar.
-        self.escape_threshold = 150.0   # Hz: looming acima disso ativa escape
-        self.escape_gain = 0.012        # ganho forte do escape
-        self.escape_symmetry = 0.7      # se |L-R|/(L+R) < 0.7, laterais são "parecidos"
-        self.escape_side = 1.0          # +1 = escapa pra direita por default
+        # Reflexo de escape: quando looming é alto, drone SEMPRE escapa
+        # (independente de simetria — simetria só define a DIREÇÃO)
+        self.escape_threshold = 100.0   # Hz: looming acima disso ativa escape
+        self.escape_gain = 0.8          # ganho forte do escape (rad/s)
 
     def step(self, flow: dict, dt: float = 1e-4) -> dict:
         """
@@ -165,34 +163,31 @@ class H1Controller:
         rate_front = r_front['spike_rate']
 
         # --- Controle diferencial normal ---
-        yaw_rate = (rate_left - rate_right) * self.yaw_gain
+        # obstacle à esquerda → rate_left alto → yaw negativo → vira à DIREITA (away)
+        yaw_rate = (rate_right - rate_left) * self.yaw_gain
 
         # --- Reflexo de escape lateral ---
-        # Ativado quando: (1) looming alto E (2) sinais laterais parecidos
-        total_lateral = rate_left + rate_right
-        if total_lateral > 1.0:  # evitar divisão por zero
-            asymmetry = abs(rate_left - rate_right) / total_lateral
-        else:
-            asymmetry = 1.0  # sem sinal = sem escape
-
-        if rate_front > self.escape_threshold and asymmetry < self.escape_symmetry:
+        # Ativado quando looming alto — SEMPRE.
+        # Simetria só define a direção (o lado com menos flow = mais espaço).
+        if rate_front > self.escape_threshold:
             # Escolhe o lado com MENOS flow (mais espaço livre)
+            # Se ambos zero (obstáculo direto em frente): escolhe direita por default
             if rate_left <= rate_right:
-                escape_dir = 1.0   # vira pra direita (esquerda tem menos obstáculo)
+                escape_dir = 1.0   # vira pra direita
             else:
                 escape_dir = -1.0  # vira pra esquerda
 
-            # Intensidade proporcional ao looming
-            escape_intensity = (rate_front - self.escape_threshold) / 500.0
+            # Intensidade proporcional ao excesso acima do threshold
+            escape_intensity = (rate_front - self.escape_threshold) / 400.0
             escape_intensity = np.clip(escape_intensity, 0.0, 1.0)
-            yaw_rate += escape_dir * escape_intensity * self.escape_gain * 50.0
+            yaw_rate += escape_dir * escape_intensity * self.escape_gain
 
         # --- Looming frontal → freia ---
         pitch_adjust = -rate_front * self.brake_gain
         throttle_adjust = rate_front * self.altitude_gain
 
         return {
-            'yaw_rate': np.clip(yaw_rate, -1.5, 1.5),
+            'yaw_rate': np.clip(yaw_rate, -2.0, 2.0),
             'pitch_adjust': np.clip(pitch_adjust, -0.6, 0.0),
             'throttle_adjust': np.clip(throttle_adjust, 0.0, 0.5),
             'rates': {
@@ -343,8 +338,9 @@ def run_simulation(gui=True, duration=30.0):
             cmd = controller.step(flow, h1_dt)
 
         # Aplicar controle
-        target_yaw = yaw + cmd['yaw_rate']
-        forward_speed = base_speed + cmd['pitch_adjust']
+        # CORREÇÃO: multiplicar yaw_rate por sim_dt — sem isso vira ~86°/step
+        target_yaw = yaw + cmd['yaw_rate'] * sim_dt
+        forward_speed = max(0.1, base_speed + cmd['pitch_adjust'])
         target_vz = cmd['throttle_adjust']
 
         # Velocidade no frame world
